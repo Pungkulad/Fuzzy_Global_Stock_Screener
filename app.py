@@ -267,6 +267,8 @@ def screen_stocks(raw, pass_threshold, watch_threshold, min_sector_peers, min_ma
 
     data = raw.copy()
     for col in METRICS:
+        if col not in data.columns:
+            data[col] = np.nan
         data[col] = pd.to_numeric(data[col], errors="coerce")
 
     def issue(row):
@@ -341,9 +343,11 @@ def screen_stocks(raw, pass_threshold, watch_threshold, min_sector_peers, min_ma
     ]]
     data = data.drop(columns=["ScreenStatus", "FuzzyWeight", "FuzzyScore100", "RankPeer", "RankMarket", "PeerBasis", "PeerCount"])
     data = data.merge(scored, on="asset_id", how="left")
-    data["ScreenStatus"] = data["ScreenStatus"].fillna(
-        np.where(data["DataIssue"].eq(""), "DATA ISSUE / INSUFFICIENT PEERS", "DATA ISSUE")
+    fallback = pd.Series(
+        np.where(data["DataIssue"].eq(""), "DATA ISSUE / INSUFFICIENT PEERS", "DATA ISSUE"),
+        index=data.index,
     )
+    data["ScreenStatus"] = data["ScreenStatus"].where(data["ScreenStatus"].notna(), fallback)
     data["DividendYield_pct"] = data["dividendYield"] * 100
     data["ROA_pct"] = data["returnOnAssets"] * 100
     data["ROE_pct"] = data["returnOnEquity"] * 100
