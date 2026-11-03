@@ -79,51 +79,149 @@ def load_us_universe():
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def load_th_universe():
+    """Load SET/mai listings from the SET directory.
+
+    The SET .xls URLs may return an HTML table instead of an Excel workbook.
+    Detect the payload format before parsing it, so pandas does not try to
+    read HTML bytes as an XLS binary file.
+    """
     urls = [
         "https://www.set.or.th/dat/eod/listedcompany/static/listedCompanies_en_US.xls",
         "https://www.set.or.th/dat/eod/listedcompany/static/listedCompanies_th_TH.xls",
     ]
     last_error = None
+
+    def flatten_columns(frame):
+        frame = frame.copy()
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = [
+                " ".join(str(part) for part in col if str(part) != "nan").strip()
+                for col in frame.columns
+            ]
+        return frame
+
+    def parse_html_tables(response):
+        # SET has, at times, served the directory as an HTML <table> fragment
+        # at the legacy .xls URL. Parse each table and select the one that has
+        # a recognizable security-symbol column.
+        tables = pd.read_html(response.text, flavor="lxml")
+        for table in tables:
+            table = flatten_columns(table)
+            if _find_column(table.columns, ["symbol", "ticker", "ชื่อย่อหลักทรัพย์"]):
+                return table
+
+            # Some HTML tables expose their first row as ordinary data rather
+            # than a header. Promote a likely header row if it contains Symbol.
+            for row_idx in range(min(5, len(table))):
+                header = [str(value).strip() for value in table.iloc[row_idx].tolist()]
+                normalized = re.sub(r"[^a-z0-9ก-๙]", "", " ".join(header).lower())
+                if "symbol" in normalized or "ชื่อย่อหลักทรัพย์" in normalized or "ticker" in normalized:
+                    body = table.iloc[row_idx + 1:].copy()
+                    body.columns = header
+                    if _find_column(body.columns, ["symbol", "ticker", "ชื่อย่อหลักทรัพย์"]):
+                        return body
+        raise ValueError(
+            "SET returned HTML, but no table with a Symbol/ชื่อย่อหลักทรัพย์ column was found"
+        )
+
     for url in urls:
         try:
-            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=25)
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/vnd.ms-excel, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, text/html;q=0.9, */*;q=0.8",
+                },
+                timeout=30,
+            )
             response.raise_for_status()
-            raw = pd.read_excel(BytesIO(response.content), engine="xlrd")
-            symbol_col = _find_column(raw.columns, ["symbol", "ชื่อย่อหลักทรัพย์"])
+            payload = response.content
+            if not payload:
+                raise ValueError("SET returned an empty response")
+
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            prefix = payload.lstrip()[:512].lower()
+            is_html = (
+                "text/html" in content_type
+                or prefix.startswith(b"<")
+                or b"<table" in prefix
+            )
+            if is_html:
+                # Use the response's declared/apparent encoding for Thai headers.
+                if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                    response.encoding = response.apparent_encoding or "utf-8"
+                raw = parse_html_tables(response)
+            else:
+                # Let pandas detect legacy XLS or XLSX from the file signature.
+                raw = pd.read_excel(BytesIO(payload))
+
+            raw = flatten_columns(raw)
+            symbol_col = _find_column(raw.columns, ["symbol", "ticker", "ชื่อย่อหลักทรัพย์"])
             if symbol_col is None:
-                continue
-            name_col = _find_column(raw.columns, ["company name", "company", "ชื่อบริษัท", "ชื่อเต็มหลักทรัพย์"])
+                raise ValueError(f"Cannot identify ticker column. Columns: {list(raw.columns)}")
+
+            name_col = _find_column(raw.columns, [
+                "company name", "company", "ชื่อบริษัท", "ชื่อเต็มหลักทรัพย์",
+                "ชื่อเต็มบริษัท", "ชื่อหลักทรัพย์",
+            ])
             market_col = _find_column(raw.columns, ["market", "ตลาด"])
-            sector_col = _find_column(raw.columns, ["sector", "industry group", "หมวดธุรกิจ", "กลุ่มอุตสาหกรรม"])
-            type_col = _find_column(raw.columns, ["security type", "ประเภทหลักทรัพย์"])
+            sector_col = _find_column(raw.columns, [
+                "sector", "industry group", "หมวดธุรกิจ", "กลุ่มอุตสาหกรรม",
+            ])
+            type_col = _find_column(raw.columns, [
+                "security type", "ประเภทหลักทรัพย์", "ประเภท",
+            ])
+
             work = raw.copy()
             if market_col:
-                mask = work[market_col].fillna("").astype(str).str.contains(r"SET|mai", case=False, regex=True)
-                if mask.any():
-                    work = work.loc[mask].copy()
+                market_values = work[market_col].fillna("").astype(str).str.strip()
+                market_mask = market_values.str.contains(
+                    r"^(SET|mai)$|SET|mai", case=False, regex=True
+                )
+                # Apply only when the source actually labels SET/mai rows.
+                if market_mask.any():
+                    work = work.loc[market_mask].copy()
+
             if type_col:
                 types = work[type_col].fillna("").astype(str)
-                common = types.str.contains(r"common stock|common share|หุ้นสามัญ", case=False, regex=True)
+                common = types.str.contains(
+                    r"common stock|common share|หุ้นสามัญ", case=False, regex=True
+                )
+                # Keep the source rows if the type labels use an unfamiliar format.
                 if common.any():
                     work = work.loc[common].copy()
+
             symbols = work[symbol_col].fillna("").astype(str).str.strip().str.upper()
             symbols = symbols.str.replace(r"\.BK$", "", regex=True)
             valid = symbols.str.match(r"^[A-Z0-9&-]{1,20}$")
             work = work.loc[valid].copy()
             symbols = symbols.loc[valid]
+
+            if work.empty:
+                raise ValueError("The SET directory was parsed, but it contained no valid ticker rows")
+
             out = pd.DataFrame({
                 "ticker": (symbols + ".BK").values,
                 "market": "TH",
-                "company": work[name_col].fillna("Unknown").astype(str).values if name_col else "Unknown",
-                "sector": work[sector_col].fillna("Unknown").astype(str).values if sector_col else "Unknown",
+                "company": (
+                    work[name_col].fillna("Unknown").astype(str).values
+                    if name_col else "Unknown"
+                ),
+                "sector": (
+                    work[sector_col].fillna("Unknown").astype(str).values
+                    if sector_col else "Unknown"
+                ),
             })
             out["asset_id"] = out["market"] + "|" + out["ticker"]
-            if not out.empty:
-                return out.drop_duplicates("asset_id").reset_index(drop=True)
-        except Exception as exc:
-            last_error = str(exc)
-    raise RuntimeError(f"SET/mai directory could not be loaded: {last_error or 'unknown error'}")
+            return out.drop_duplicates("asset_id").reset_index(drop=True)
 
+        except Exception as exc:
+            last_error = f"{url}: {type(exc).__name__}: {exc}"
+
+    raise RuntimeError(
+        "ไม่สามารถอ่านรายชื่อ SET/mai ได้จากไฟล์ Excel หรือ HTML directory "
+        f"ที่ SET ส่งกลับมา รายละเอียดล่าสุด: {last_error}"
+    )
 
 def infer_market(ticker):
     suffixes = {
