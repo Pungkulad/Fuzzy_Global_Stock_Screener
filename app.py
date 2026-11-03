@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 from itertools import product
 import re
 import time
@@ -104,7 +104,7 @@ def load_th_universe():
         # SET has, at times, served the directory as an HTML <table> fragment
         # at the legacy .xls URL. Parse each table and select the one that has
         # a recognizable security-symbol column.
-        tables = pd.read_html(response.text, flavor="lxml")
+        tables = pd.read_html(StringIO(response.text), flavor="lxml")
         for table in tables:
             table = flatten_columns(table)
             if _find_column(table.columns, ["symbol", "ticker", "ชื่อย่อหลักทรัพย์"]):
