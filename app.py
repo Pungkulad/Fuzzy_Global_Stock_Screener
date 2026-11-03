@@ -358,12 +358,26 @@ def fuzzy_cog(values):
 # ----------------------------- Screening -----------------------------
 
 def screen_stocks(raw, pass_threshold, watch_threshold, min_sector_peers, min_market_peers):
+    """Score only complete-fundamental rows with a sufficiently large peer group.
+
+    DATA ISSUE and INSUFFICIENT PEERS are kept separate:
+    - DATA ISSUE: one or more required fundamentals are missing/invalid.
+    - INSUFFICIENT PEERS: fundamentals are complete, but the selected scan
+      does not contain enough comparable stocks to form a benchmark group.
+    """
     if raw.empty:
         return pd.DataFrame()
     if watch_threshold > pass_threshold:
         raise ValueError("WATCH threshold must not exceed PASS threshold")
 
     data = raw.copy()
+    required_metadata = [
+        "asset_id", "ticker", "market", "sector", "fetch_status", "fetch_error",
+        "quoteType", "profitMargins", "revenueGrowth",
+    ]
+    for col in required_metadata:
+        if col not in data.columns:
+            data[col] = np.nan if col in ("profitMargins", "revenueGrowth") else ""
     for col in METRICS:
         if col not in data.columns:
             data[col] = np.nan
@@ -371,7 +385,7 @@ def screen_stocks(raw, pass_threshold, watch_threshold, min_sector_peers, min_ma
 
     def issue(row):
         if row.get("fetch_status") != "OK":
-            return row.get("fetch_error") or "Fundamental data unavailable"
+            return str(row.get("fetch_error") or "Fundamental data unavailable")
         quote_type = str(row.get("quoteType", "")).upper()
         if quote_type and quote_type != "EQUITY":
             return f"Unsupported asset type: {quote_type}"
@@ -385,74 +399,118 @@ def screen_stocks(raw, pass_threshold, watch_threshold, min_sector_peers, min_ma
         return "; ".join(reasons)
 
     data["DataIssue"] = data.apply(issue, axis=1)
+    data["ScreenStatus"] = np.where(data["DataIssue"].eq(""), "PENDING PEER CHECK", "DATA ISSUE")
+    data["PeerIssue"] = ""
+    data["PeerBasis"] = ""
+    data["PeerCount"] = np.nan
+    data["SectorPeerCount"] = np.nan
+    data["MarketPeerCount"] = np.nan
+    data["FuzzyWeight"] = np.nan
+    data["FuzzyScore100"] = np.nan
+    data["RankPeer"] = np.nan
+    data["RankMarket"] = np.nan
+
     valid = data[data["DataIssue"].eq("")].copy()
-    data["ScreenStatus"] = "DATA ISSUE"
-    for col in ["FuzzyWeight", "FuzzyScore100", "RankPeer", "RankMarket", "PeerBasis", "PeerCount"]:
-        data[col] = np.nan
-
     if valid.empty:
-        return data
+        data["DividendYield_pct"] = data["dividendYield"] * 100
+        data["ROA_pct"] = data["returnOnAssets"] * 100
+        data["ROE_pct"] = data["returnOnEquity"] * 100
+        data["ProfitMargin_pct"] = pd.to_numeric(data["profitMargins"], errors="coerce") * 100
+        data["RevenueGrowth_pct"] = pd.to_numeric(data["revenueGrowth"], errors="coerce") * 100
+        return data.sort_values("ticker").reset_index(drop=True)
 
-    valid["market"] = valid["market"].fillna("Unknown").astype(str)
-    valid["sector"] = valid["sector"].fillna("Unknown").replace("", "Unknown").astype(str)
-    sector_counts = valid.groupby(["market", "sector"])["ticker"].transform("count")
-    market_counts = valid.groupby("market")["ticker"].transform("count")
-    sector_ok = sector_counts.ge(min_sector_peers) & valid["sector"].ne("Unknown")
-    market_ok = market_counts.ge(min_market_peers)
+    valid["market"] = valid["market"].fillna("Unknown").astype(str).str.strip()
+    valid["sector"] = valid["sector"].fillna("Unknown").replace("", "Unknown").astype(str).str.strip()
+    valid["SectorPeerCount"] = valid.groupby(["market", "sector"])["ticker"].transform("count")
+    valid["MarketPeerCount"] = valid.groupby("market")["ticker"].transform("count")
+
+    sector_ok = valid["SectorPeerCount"].ge(min_sector_peers) & valid["sector"].ne("Unknown")
+    market_ok = valid["MarketPeerCount"].ge(min_market_peers)
     valid["peer_group"] = np.where(
         sector_ok,
         valid["market"] + "|" + valid["sector"],
         np.where(market_ok, valid["market"] + "|ALL", None),
     )
-    valid["PeerBasis"] = np.where(sector_ok, "Sector", np.where(market_ok, "Market", "Insufficient"))
-    valid = valid[valid["peer_group"].notna()].copy()
-    if valid.empty:
-        data["ScreenStatus"] = "DATA ISSUE / INSUFFICIENT PEERS"
-        return data
-
-    # Lower P/E and P/BV are better; higher dividend yield, ROA and ROE are better.
-    valid["pe_quality"] = valid.groupby("peer_group")["trailingPE"].rank(ascending=False, pct=True)
-    valid["pb_quality"] = valid.groupby("peer_group")["priceToBook"].rank(ascending=False, pct=True)
-    valid["div_quality"] = valid.groupby("peer_group")["dividendYield"].rank(ascending=True, pct=True)
-    valid["roa_quality"] = valid.groupby("peer_group")["returnOnAssets"].rank(ascending=True, pct=True)
-    valid["roe_quality"] = valid.groupby("peer_group")["returnOnEquity"].rank(ascending=True, pct=True)
-
-    quality_cols = ["pe_quality", "pb_quality", "div_quality", "roa_quality", "roe_quality"]
-    valid["FuzzyWeight"] = valid[quality_cols].apply(lambda row: fuzzy_cog(row.to_numpy()), axis=1)
-    valid["FuzzyScore100"] = valid["FuzzyWeight"] * 100
-    valid["PeerCount"] = valid.groupby("peer_group")["ticker"].transform("count")
-    valid["RankPeer"] = valid.groupby("peer_group")["FuzzyWeight"].rank(ascending=False, method="min")
-    valid["RankMarket"] = valid.groupby("market")["FuzzyWeight"].rank(ascending=False, method="min")
-
-    def classify(row):
-        score = row["FuzzyWeight"]
-        if pd.isna(score):
-            return "DATA ISSUE"
-        if score >= pass_threshold and row["returnOnAssets"] > 0 and row["returnOnEquity"] > 0:
-            return "PASS"
-        if score >= watch_threshold:
-            return "WATCH"
-        return "LOW PRIORITY"
-
-    valid["ScreenStatus"] = valid.apply(classify, axis=1)
-    scored = valid[[
-        "asset_id", "ScreenStatus", "FuzzyWeight", "FuzzyScore100",
-        "RankPeer", "RankMarket", "PeerBasis", "PeerCount",
-    ]]
-    data = data.drop(columns=["ScreenStatus", "FuzzyWeight", "FuzzyScore100", "RankPeer", "RankMarket", "PeerBasis", "PeerCount"])
-    data = data.merge(scored, on="asset_id", how="left")
-    fallback = pd.Series(
-        np.where(data["DataIssue"].eq(""), "DATA ISSUE / INSUFFICIENT PEERS", "DATA ISSUE"),
-        index=data.index,
+    valid["PeerBasis"] = np.where(
+        sector_ok, "Sector",
+        np.where(market_ok, "Market", "Insufficient"),
     )
-    data["ScreenStatus"] = data["ScreenStatus"].where(data["ScreenStatus"].notna(), fallback)
+    valid["PeerCount"] = np.where(
+        sector_ok, valid["SectorPeerCount"],
+        np.where(market_ok, valid["MarketPeerCount"], np.nan),
+    )
+
+    insufficient_mask = valid["peer_group"].isna()
+    valid.loc[insufficient_mask, "PeerIssue"] = valid.loc[insufficient_mask].apply(
+        lambda row: (
+            f"ข้อมูลพื้นฐานครบ แต่จำนวนหุ้นเปรียบเทียบไม่พอ: "
+            f"Sector peers {int(row['SectorPeerCount'])}/{min_sector_peers}; "
+            f"Market peers {int(row['MarketPeerCount'])}/{min_market_peers}. "
+            "สแกนหุ้นเพิ่มในตลาดเดียวกันก่อนคำนวณคะแนน"
+        ),
+        axis=1,
+    )
+    data = data.drop(columns=[
+        "PeerIssue", "PeerBasis", "PeerCount", "SectorPeerCount", "MarketPeerCount",
+    ]).merge(
+        valid[[
+            "asset_id", "PeerIssue", "PeerBasis", "PeerCount",
+            "SectorPeerCount", "MarketPeerCount",
+        ]],
+        on="asset_id", how="left",
+    )
+    data.loc[data["DataIssue"].eq("") & data["PeerBasis"].eq("Insufficient"), "ScreenStatus"] = "INSUFFICIENT PEERS"
+
+    eligible = valid[valid["peer_group"].notna()].copy()
+    if not eligible.empty:
+        # Lower P/E and P/BV are better; higher dividend yield, ROA and ROE are better.
+        eligible["pe_quality"] = eligible.groupby("peer_group")["trailingPE"].rank(ascending=False, pct=True)
+        eligible["pb_quality"] = eligible.groupby("peer_group")["priceToBook"].rank(ascending=False, pct=True)
+        eligible["div_quality"] = eligible.groupby("peer_group")["dividendYield"].rank(ascending=True, pct=True)
+        eligible["roa_quality"] = eligible.groupby("peer_group")["returnOnAssets"].rank(ascending=True, pct=True)
+        eligible["roe_quality"] = eligible.groupby("peer_group")["returnOnEquity"].rank(ascending=True, pct=True)
+
+        quality_cols = ["pe_quality", "pb_quality", "div_quality", "roa_quality", "roe_quality"]
+        eligible["FuzzyWeight"] = eligible[quality_cols].apply(
+            lambda row: fuzzy_cog(row.to_numpy()), axis=1
+        )
+        eligible["FuzzyScore100"] = eligible["FuzzyWeight"] * 100
+        eligible["RankPeer"] = eligible.groupby("peer_group")["FuzzyWeight"].rank(
+            ascending=False, method="min"
+        )
+        eligible["RankMarket"] = eligible.groupby("market")["FuzzyWeight"].rank(
+            ascending=False, method="min"
+        )
+
+        def classify(row):
+            score = row["FuzzyWeight"]
+            if pd.isna(score):
+                return "DATA ISSUE"
+            if score >= pass_threshold and row["returnOnAssets"] > 0 and row["returnOnEquity"] > 0:
+                return "PASS"
+            if score >= watch_threshold:
+                return "WATCH"
+            return "LOW PRIORITY"
+
+        eligible["ScreenStatus"] = eligible.apply(classify, axis=1)
+        score_cols = [
+            "asset_id", "ScreenStatus", "FuzzyWeight", "FuzzyScore100",
+            "RankPeer", "RankMarket",
+        ]
+        data = data.drop(columns=[
+            "FuzzyWeight", "FuzzyScore100", "RankPeer", "RankMarket",
+        ]).merge(eligible[score_cols], on="asset_id", how="left", suffixes=("", "_scored"))
+        if "ScreenStatus_scored" in data.columns:
+            scored_mask = data["ScreenStatus_scored"].notna()
+            data.loc[scored_mask, "ScreenStatus"] = data.loc[scored_mask, "ScreenStatus_scored"]
+            data = data.drop(columns=["ScreenStatus_scored"])
+
     data["DividendYield_pct"] = data["dividendYield"] * 100
     data["ROA_pct"] = data["returnOnAssets"] * 100
     data["ROE_pct"] = data["returnOnEquity"] * 100
-    data["ProfitMargin_pct"] = data["profitMargins"] * 100
-    data["RevenueGrowth_pct"] = data["revenueGrowth"] * 100
+    data["ProfitMargin_pct"] = pd.to_numeric(data["profitMargins"], errors="coerce") * 100
+    data["RevenueGrowth_pct"] = pd.to_numeric(data["revenueGrowth"], errors="coerce") * 100
     return data.sort_values("FuzzyWeight", ascending=False, na_position="last").reset_index(drop=True)
-
 
 # ----------------------------- Excel report -----------------------------
 
@@ -461,10 +519,11 @@ def excel_report(result, pass_threshold, watch_threshold):
     passed = result[result["ScreenStatus"].eq("PASS")]
     watch = result[result["ScreenStatus"].eq("WATCH")]
     low = result[result["ScreenStatus"].eq("LOW PRIORITY")]
-    issues = result[result["ScreenStatus"].astype(str).str.contains("DATA ISSUE", case=False, na=False)]
+    issues = result[result["ScreenStatus"].eq("DATA ISSUE")]
+    peer_issues = result[result["ScreenStatus"].eq("INSUFFICIENT PEERS")]
     summary = pd.DataFrame({
-        "Metric": ["Generated at", "Scanned stocks", "PASS", "WATCH", "LOW PRIORITY", "DATA ISSUES", "PASS threshold", "WATCH threshold"],
-        "Value": [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(result), len(passed), len(watch), len(low), len(issues), pass_threshold, watch_threshold],
+        "Metric": ["Generated at", "Scanned stocks", "PASS", "WATCH", "LOW PRIORITY", "DATA ISSUES", "INSUFFICIENT PEERS", "PASS threshold", "WATCH threshold"],
+        "Value": [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(result), len(passed), len(watch), len(low), len(issues), len(peer_issues), pass_threshold, watch_threshold],
     })
     methodology = pd.DataFrame({
         "Item": ["Model", "Method", "Factors", "Fuzzy inference", "Rule count", "Defuzzification", "Peer comparison", "Data provider", "Limitation"],
@@ -482,6 +541,7 @@ def excel_report(result, pass_threshold, watch_threshold):
         watch.to_excel(writer, sheet_name="WATCH", index=False)
         low.to_excel(writer, sheet_name="Low Priority", index=False)
         issues.to_excel(writer, sheet_name="Data Issues", index=False)
+        peer_issues.to_excel(writer, sheet_name="Insufficient Peers", index=False)
         methodology.to_excel(writer, sheet_name="Methodology", index=False)
     output.seek(0)
     return output.getvalue()
@@ -625,7 +685,17 @@ if st.session_state.universe_ready:
 
     if st.session_state.records:
         st.caption(f"ดึงข้อมูลแล้ว {len(st.session_state.records):,} / {total:,} หุ้น")
-        if st.button("3. คำนวณคะแนนและจัดอันดับ", type="primary", use_container_width=True):
+        if cursor < total:
+            st.warning(
+                "ยังสแกนรายชื่อไม่ครบ ระบบจะยังไม่เปิดให้คำนวณคะแนน "
+                "เพราะ Peer Percentile ต้องใช้หุ้นทั้งหมดใน Universe ที่เลือก"
+            )
+        if st.button(
+            "3. คำนวณคะแนนและจัดอันดับ",
+            type="primary",
+            use_container_width=True,
+            disabled=(cursor < total),
+        ):
             with st.spinner("กำลังคำนวณ Peer Percentile และ Fuzzy Score..."):
                 raw = pd.DataFrame(st.session_state.records)
                 st.session_state.results = screen_stocks(
@@ -640,21 +710,24 @@ if not st.session_state.results.empty:
     passed = result[result["ScreenStatus"].eq("PASS")]
     watched = result[result["ScreenStatus"].eq("WATCH")]
     low = result[result["ScreenStatus"].eq("LOW PRIORITY")]
-    issues = result[result["ScreenStatus"].astype(str).str.contains("DATA ISSUE", case=False, na=False)]
+    issues = result[result["ScreenStatus"].eq("DATA ISSUE")]
+    peer_issues = result[result["ScreenStatus"].eq("INSUFFICIENT PEERS")]
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("สแกนทั้งหมด", f"{len(result):,}")
     c2.metric("PASS", f"{len(passed):,}")
     c3.metric("WATCH", f"{len(watched):,}")
     c4.metric("ข้อมูลไม่ครบ", f"{len(issues):,}")
+    c5.metric("Peer ไม่พอ", f"{len(peer_issues):,}")
 
     display_cols = [
         "ticker", "company", "market", "sector", "currency", "trailingPE",
         "priceToBook", "DividendYield_pct", "ROA_pct", "ROE_pct",
         "FuzzyScore100", "RankPeer", "RankMarket", "PeerBasis",
-        "PeerCount", "ScreenStatus", "DataIssue",
+        "PeerCount", "SectorPeerCount", "MarketPeerCount", "PeerBasis",
+        "ScreenStatus", "DataIssue", "PeerIssue",
     ]
-    tabs = st.tabs(["ภาพรวม", "PASS", "WATCH", "LOW PRIORITY", "ข้อมูลไม่ครบ", "ทั้งหมด"])
+    tabs = st.tabs(["ภาพรวม", "PASS", "WATCH", "LOW PRIORITY", "ข้อมูลไม่ครบ", "Peer ไม่พอ", "ทั้งหมด"])
     with tabs[0]:
         top = result[result["FuzzyScore100"].notna()].head(20)
         if not top.empty:
@@ -670,6 +743,8 @@ if not st.session_state.results.empty:
     with tabs[4]:
         st.dataframe(issues[[c for c in display_cols if c in issues.columns]], use_container_width=True, hide_index=True)
     with tabs[5]:
+        st.dataframe(peer_issues[[c for c in display_cols if c in peer_issues.columns]], use_container_width=True, hide_index=True)
+    with tabs[6]:
         st.dataframe(result[[c for c in display_cols if c in result.columns]], use_container_width=True, hide_index=True)
 
     try:
