@@ -576,8 +576,9 @@ with st.sidebar:
         ["Starter Watchlist", "Thailand (SET/mai)", "United States", "Custom Tickers"],
         index=0,
     )
-    max_symbols = st.slider("จำนวนหุ้นสูงสุด", 5, 200, 30, step=5)
-    batch_size = st.select_slider("หุ้นต่อรอบ", options=[5, 10, 20, 30, 50], value=10)
+    max_symbols = st.slider("จำนวนหุ้นสูงสุด", 5, 200, 100, step=5)
+    st.caption("ถ้ารายชื่อมีมากกว่าจำนวนที่กำหนด ระบบจะสุ่มตัวอย่างแบบคงที่ ไม่เลือกเฉพาะหุ้นตัวอักษรต้น ๆ")
+    batch_size = st.select_slider("หุ้นต่อรอบ", options=[5, 10, 20, 30, 50], value=20)
     pass_threshold = st.slider("เกณฑ์ PASS", 0.40, 0.90, 0.60, step=0.05)
     watch_threshold = st.slider(
         "เกณฑ์ WATCH",
@@ -633,7 +634,13 @@ if prepare_clicked:
         if candidates.empty:
             st.error("ไม่พบรายชื่อหุ้น กรุณาลองใหม่หรือใช้ Custom Tickers")
         else:
-            candidates = candidates.head(max_symbols).reset_index(drop=True)
+            if universe_choice in ("Thailand (SET/mai)", "United States") and len(candidates) > max_symbols:
+                # Avoid taking only the alphabetically first listings (e.g. 2S, 3BBIF, 88TH, A...).
+                # A fixed seed makes the sample reproducible between runs.
+                candidates = candidates.sample(n=max_symbols, random_state=42)
+            else:
+                candidates = candidates.head(max_symbols)
+            candidates = candidates.reset_index(drop=True)
             st.session_state.candidates = candidates.to_dict("records")
             st.session_state.cursor = 0
             st.session_state.records = []
@@ -724,7 +731,7 @@ if not st.session_state.results.empty:
         "ticker", "company", "market", "sector", "currency", "trailingPE",
         "priceToBook", "DividendYield_pct", "ROA_pct", "ROE_pct",
         "FuzzyScore100", "RankPeer", "RankMarket", "PeerBasis",
-        "PeerCount", "SectorPeerCount", "MarketPeerCount", "PeerBasis",
+        "PeerCount", "SectorPeerCount", "MarketPeerCount",
         "ScreenStatus", "DataIssue", "PeerIssue",
     ]
     tabs = st.tabs(["ภาพรวม", "PASS", "WATCH", "LOW PRIORITY", "ข้อมูลไม่ครบ", "Peer ไม่พอ", "ทั้งหมด"])
