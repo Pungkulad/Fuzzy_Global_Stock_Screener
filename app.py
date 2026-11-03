@@ -421,7 +421,13 @@ with st.sidebar:
     max_symbols = st.slider("จำนวนหุ้นสูงสุด", 5, 200, 30, step=5)
     batch_size = st.select_slider("หุ้นต่อรอบ", options=[5, 10, 20, 30, 50], value=10)
     pass_threshold = st.slider("เกณฑ์ PASS", 0.40, 0.90, 0.60, step=0.05)
-    watch_threshold = st.slider("เกณฑ์ WATCH", 0.30, 0.85, 0.50, step=0.05)
+    watch_threshold = st.slider(
+        "เกณฑ์ WATCH",
+        0.30,
+        float(pass_threshold),
+        min(0.50, float(pass_threshold)),
+        step=0.05,
+    )
     min_sector_peers = st.slider("จำนวนหุ้นขั้นต่ำในกลุ่มอุตสาหกรรม", 3, 20, 8)
     min_market_peers = st.slider("จำนวนหุ้นขั้นต่ำในตลาด", 3, 20, 5)
     custom_text = st.text_area(
